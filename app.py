@@ -4,6 +4,7 @@ import pandas as pd
 from generator import DataGenerator
 from analyzer import FraudAnalyzer
 from worker import WorkManager
+from ml_trainer import MLTrainer
 
 st.set_page_config(page_title="Fraud Detection Simulation", layout="wide")
 st.title("🛡️ Real-Time Multi-Threaded Fraud Detection")
@@ -18,6 +19,7 @@ if "analyzer" not in st.session_state:
 st.sidebar.header("⚙️ Simulation Controls")
 batch_size = st.sidebar.slider("Batch Size", 50, 2000, 500)
 threads = st.sidebar.slider("Worker Threads", 1, 16, 4)
+use_ml = st.sidebar.checkbox("🧠 Enable Machine Learning (Isolation Forest)", value=False)
 
 if st.sidebar.button("🚀 Generate & Process Data"):
     with st.spinner(f"Generating and processing {batch_size} transactions..."):
@@ -25,8 +27,18 @@ if st.sidebar.button("🚀 Generate & Process Data"):
         tx_batch = st.session_state.generator.generate_batch(batch_size)
         st.session_state.total_tx_data.extend(tx_batch)
         
+        # Handle ML Model
+        if use_ml and getattr(st.session_state.analyzer, 'ml_model', None) is None:
+            st.info("Initiating Machine Learning... Training Isolation Forest on warm-up data.")
+            warmup_batch = st.session_state.generator.generate_batch(2000)
+            ml_model = MLTrainer.train_isolation_forest(warmup_batch)
+            st.session_state.analyzer.ml_model = ml_model
+            st.toast("✅ ML Model Trained & Loaded!")
+        elif not use_ml:
+            st.session_state.analyzer.ml_model = None
+        
         # 1. Benchmark Single-Threaded (using a dummy analyzer to not double-count stats)
-        dummy_analyzer = FraudAnalyzer()
+        dummy_analyzer = FraudAnalyzer(ml_model=st.session_state.analyzer.ml_model)
         start = time.time()
         WorkManager.process_single_threaded(tx_batch, dummy_analyzer)
         single_time = time.time() - start
