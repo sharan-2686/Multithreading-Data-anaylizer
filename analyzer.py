@@ -11,6 +11,10 @@ class FraudAnalyzer:
         self.lock = threading.Lock()
         self.ml_model = ml_model
         
+        # Thread tracking
+        self.thread_counts = {}
+        self.thread_timeline = []
+        
         # User history: Dict[user_id, List[transaction]]
         self.user_history = {}
         
@@ -52,10 +56,12 @@ class FraudAnalyzer:
         Returns the analysis result.
         """
         import time
-        # Simulate a realistic I/O bound network request (e.g. 10ms database lookup or RPC call)
-        # Because Scikit-Learn `.predict()` operations are extremely CPU heavy and suffer from Python's GIL,
-        # real-world multi-threading depends on these network delays to cycle active threads.
-        time.sleep(0.01) 
+        import random
+        start_time = time.time()
+        
+        # Simulate randomly variant I/O network conditions (e.g., 5ms to 25ms database latency).
+        # This causes the threads to run asynchronously and creates realistic visible interleaving.
+        time.sleep(random.uniform(0.005, 0.025)) 
         
         user_id = tx["user_id"]
         amount = tx["amount"]
@@ -130,8 +136,20 @@ class FraudAnalyzer:
             "reason": reason_str
         }
         
+        
+        end_time = time.time()
+        
         # 3. Quickly update global metrics inside minimal lock
         with self.lock:
+            thread_name = threading.current_thread().name
+            self.thread_counts[thread_name] = self.thread_counts.get(thread_name, 0) + 1
+            
+            self.thread_timeline.append({
+                "Thread": thread_name,
+                "Start": start_time,
+                "End": end_time
+            })
+            
             self.total_processed += 1
             if fraud_flag:
                 self.total_flagged += 1
