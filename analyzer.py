@@ -1,5 +1,7 @@
 import threading
 import math
+import time
+import random
 import numpy as np
 from ml_trainer import extract_features
 
@@ -159,3 +161,131 @@ class FraudAnalyzer:
                 })
                 
         return result
+
+
+class UnsafeFraudAnalyzer:
+    """
+    INTENTIONALLY UNSAFE version of FraudAnalyzer with NO thread locking.
+    Used purely to DEMONSTRATE race conditions and data corruption.
+    DO NOT use this in production!
+    """
+    def __init__(self):
+        # NO lock — this is the bug
+        self.count = 0
+        self.mean = 0.0
+        self.M2 = 0.0
+        self.total_processed = 0
+        self.total_flagged = 0
+        self.flagged_transactions = []
+        self.user_history = {}
+        self.thread_timeline = []
+        self.corruption_events = []  # Tracks detected corruptions
+
+    def _update_global_stats(self, amount):
+        # ⚠️ No lock — multiple threads can corrupt these simultaneously!
+        self.count += 1
+        delta = amount - self.mean
+        self.mean += delta / self.count
+        delta2 = amount - self.mean
+        self.M2 += delta * delta2
+
+    def _get_std_dev(self):
+        if self.count < 2:
+            return 0.0
+        try:
+            return math.sqrt(abs(self.M2 / (self.count - 1)))
+        except Exception:
+            return 0.0
+
+    def get_summary(self):
+        return {
+            "total_processed": self.total_processed,
+            "total_flagged": self.total_flagged,
+            "fraud_rate": f"{(self.total_flagged / self.total_processed * 100):.2f}%" if self.total_processed else "0.00%",
+            "mean_amount": round(self.mean, 2),
+            "std_dev_amount": round(self._get_std_dev(), 2),
+            "corruption_events": len(self.corruption_events)
+        }
+
+    def analyze(self, tx):
+        start_time = time.time()
+        prev_count = self.total_processed
+
+        # Simulate I/O — GIL releases here, other threads rush in!
+        time.sleep(random.uniform(0.005, 0.025))
+
+        # ⚠️ RACE CONDITION ZONE — no lock protecting any of this!
+        user_id = tx["user_id"]
+        amount  = tx["amount"]
+        timestamp = tx["timestamp"]
+
+        # These reads + writes are NOT atomic — threads can interleave here
+        self._update_global_stats(amount)
+
+        if user_id not in self.user_history:
+            self.user_history[user_id] = []
+        self.user_history[user_id].append(tx)
+        if len(self.user_history[user_id]) > 10:
+            self.user_history[user_id].pop(0)
+
+        history_copy = list(self.user_history.get(user_id, []))
+        recent_txs   = [t for t in history_copy if timestamp - t["timestamp"] < 60]
+
+        risk_score = 0
+        reasons    = []
+        if amount > 10000.0:
+            risk_score += 50
+            reasons.append("High value transaction")
+
+        std_dev = self._get_std_dev()
+        if self.count >= 10 and std_dev > 0:
+            z_score = abs(amount - self.mean) / std_dev
+            if z_score > 3.0:
+                risk_score += 40
+                reasons.append(f"Statistical anomaly (Z-score: {z_score:.2f})")
+
+        if len(recent_txs) >= 4:
+            risk_score += 30
+            reasons.append("Rapid successive transactions")
+
+        locations = set(t["location"] for t in recent_txs)
+        if len(locations) > 1:
+            risk_score += 60
+            reasons.append("Location anomaly")
+
+        risk_score = min(100, risk_score)
+        fraud_flag = risk_score >= 50
+
+        # ⚠️ Check for corruption: counter jumped by more than 1 (another thread wrote between our read and write)
+        after_count = self.total_processed
+        if after_count != prev_count:
+            self.corruption_events.append({
+                "thread": threading.current_thread().name,
+                "expected": prev_count + 1,
+                "found": after_count + 1
+            })
+
+        # These increments are NOT atomic — data loss happens here!
+        self.total_processed += 1
+        if fraud_flag:
+            self.total_flagged += 1
+            self.flagged_transactions.append({"tx": tx, "analysis": {
+                "transaction_id": tx["transaction_id"],
+                "risk_score": risk_score,
+                "fraud_flag": fraud_flag,
+                "reason": ", ".join(reasons) if reasons else "Normal"
+            }})
+
+        end_time = time.time()
+        self.thread_timeline.append({
+            "Thread": threading.current_thread().name,
+            "Start": start_time,
+            "End": end_time
+        })
+
+        return {
+            "transaction_id": tx["transaction_id"],
+            "risk_score": risk_score,
+            "fraud_flag": fraud_flag,
+            "reason": ", ".join(reasons) if reasons else "Normal"
+        }

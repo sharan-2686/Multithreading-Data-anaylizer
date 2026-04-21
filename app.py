@@ -2,7 +2,7 @@ import streamlit as st
 import time
 import pandas as pd
 from generator import DataGenerator
-from analyzer import FraudAnalyzer
+from analyzer import FraudAnalyzer, UnsafeFraudAnalyzer
 from worker import WorkManager
 from ml_trainer import MLTrainer
 import altair as alt
@@ -16,6 +16,7 @@ if "analyzer" not in st.session_state:
     st.session_state.generator = DataGenerator(num_users=200)
     st.session_state.total_tx_data = []
     st.session_state.performance_log = []
+    st.session_state.race_result = None
 
 st.sidebar.header("⚙️ Simulation Controls")
 batch_size = st.sidebar.slider("Batch Size", 50, 2000, 500)
@@ -175,3 +176,112 @@ with col_gant_multi:
         st.caption("Multiple threads process transactions concurrently. Notice the overlapping colored execution blocks filling idle gaps!")
     else:
         st.info("No timeline data yet.")
+
+# ─────────────────────────────────────────────────────────
+# RACE CONDITION DEMO SECTION
+# ─────────────────────────────────────────────────────────
+st.markdown("---")
+st.subheader("☠️ Race Condition Demo: Safe Lock vs No Lock")
+
+st.markdown("""
+> **What is a Race Condition?**  
+> When two threads read and write the **same variable at the same time**, 
+> they corrupt each other's results. This demo runs the **same transactions** 
+> through a **safe (locked)** and an **unsafe (no lock)** analyzer side by side 
+> so you can see the data corruption happen in real time.
+""")
+
+race_batch_size = st.slider("Race Demo — Batch Size", 50, 300, 100, key="race_batch")
+race_threads    = st.slider("Race Demo — Thread Count", 2, 16, 8, key="race_threads")
+
+if st.button("⚡ Run Race Condition Demo", type="primary"):
+    with st.spinner("Running safe vs unsafe comparison..."):
+        race_batch = st.session_state.generator.generate_batch(race_batch_size)
+
+        # --- SAFE run (with lock) ---
+        safe_analyzer = FraudAnalyzer()
+        WorkManager.process_multi_threaded(race_batch, safe_analyzer, thread_count=race_threads)
+        safe_summary  = safe_analyzer.get_summary()
+
+        # --- UNSAFE run (no lock) ---
+        unsafe_analyzer = UnsafeFraudAnalyzer()
+        WorkManager.process_multi_threaded(race_batch, unsafe_analyzer, thread_count=race_threads)
+        unsafe_summary  = unsafe_analyzer.get_summary()
+
+        st.session_state.race_result = {
+            "batch_size":  race_batch_size,
+            "threads":     race_threads,
+            "safe":        safe_summary,
+            "unsafe":      unsafe_summary,
+            "corruption":  unsafe_analyzer.corruption_events[:20],  # first 20 events
+            "safe_timeline":   safe_analyzer.thread_timeline,
+            "unsafe_timeline": unsafe_analyzer.thread_timeline,
+        }
+
+if st.session_state.race_result:
+    r = st.session_state.race_result
+    expected = r["batch_size"]
+    safe_count   = r["safe"]["total_processed"]
+    unsafe_count = r["unsafe"]["total_processed"]
+    lost_txns    = expected - unsafe_count
+    n_corruptions = r["unsafe"].get("corruption_events", 0)
+
+    st.markdown(f"#### Results — {expected} transactions, {r['threads']} threads")
+
+    col_s, col_u = st.columns(2)
+
+    with col_s:
+        st.success("✅ SAFE Analyzer (with Lock)")
+        st.metric("Transactions Processed", safe_count,
+                  delta=f"Expected: {expected}",
+                  delta_color="off")
+        st.metric("Fraud Rate",  r["safe"]["fraud_rate"])
+        st.metric("Mean Amount", f"${r['safe']['mean_amount']:.2f}")
+        st.caption("🔒 `threading.Lock()` ensures only ONE thread modifies shared state at a time. Every transaction is counted exactly once.")
+
+    with col_u:
+        st.error("☠️ UNSAFE Analyzer (NO Lock)")
+        st.metric("Transactions Processed", unsafe_count,
+                  delta=f"{lost_txns:+d} lost (data corruption!)",
+                  delta_color="inverse")
+        st.metric("Fraud Rate",  r["unsafe"]["fraud_rate"])
+        st.metric("Mean Amount", f"${r['unsafe']['mean_amount']:.2f}")
+        st.caption("⚠️ No lock means threads overwrite each other's counter increments. Transactions vanish — the count is WRONG, and it's different every run!")
+
+    # Explanation of what went wrong
+    st.markdown("---")
+    st.markdown("#### 🔬 Why the Count is Wrong — The Race Condition Explained")
+    st.code("""
+# Two threads execute self.total_processed += 1 at the same time:
+
+Thread A reads:  total_processed = 42
+Thread B reads:  total_processed = 42   ← reads BEFORE A wrote back!
+Thread A writes: total_processed = 43
+Thread B writes: total_processed = 43   ← overwrites A! One count is LOST.
+
+# Expected: 44  |  Actual: 43  → 1 transaction vanished!
+# This happens hundreds of times across 8 threads.""", language="python")
+
+    if r["corruption"]:
+        st.markdown(f"**Detected {n_corruptions} corruption events** (showing first {len(r['corruption'])})")
+        st.dataframe(
+            pd.DataFrame(r["corruption"]),
+            use_container_width=True
+        )
+    else:
+        st.info("No corruption events captured this run — try a larger batch or more threads.")
+
+    # Side-by-side Gantt chart comparison
+    st.markdown("#### ⏱️ Thread Timeline: Safe vs Unsafe")
+    col_sg, col_ug = st.columns(2)
+    with col_sg:
+        st.markdown("**Safe (Locked)**")
+        safe_chart = generate_gantt_chart(r["safe_timeline"], "Safe — Ordered Execution")
+        if safe_chart:
+            st.altair_chart(safe_chart, use_container_width=True)
+    with col_ug:
+        st.markdown("**Unsafe (No Lock)**")
+        unsafe_chart = generate_gantt_chart(r["unsafe_timeline"], "Unsafe — Chaotic Interleaving")
+        if unsafe_chart:
+            st.altair_chart(unsafe_chart, use_container_width=True)
+        st.caption("Notice no structural difference in the Gantt — the chaos is INVISIBLE in timing but destroys data correctness!")
