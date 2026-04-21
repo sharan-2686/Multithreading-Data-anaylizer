@@ -4,6 +4,7 @@ import csv
 from generator import DataGenerator
 from analyzer import FraudAnalyzer
 from worker import WorkManager
+from ml_trainer import MLTrainer
 
 def _print_results(analyzer, execution_time, thread_type):
     print(f"\n--- {thread_type} Execution ---")
@@ -42,6 +43,7 @@ def main():
     parser.add_argument("--count", type=int, default=20000, help="Number of simulation transactions to generate")
     parser.add_argument("--threads", type=int, default=4, help="Number of threads for multi-threaded processing")
     parser.add_argument("--export", action="store_true", help="Export flagged transactions to CSV")
+    parser.add_argument("--ml", action="store_true", help="Enable Machine Learning (Isolation Forest) Anomaly Detection")
     
     args = parser.parse_args()
     
@@ -51,15 +53,22 @@ def main():
     transactions = gen.generate_batch(args.count)
     print("Generation complete.\n")
     
+    # --- ML Training ---
+    ml_model = None
+    if args.ml:
+        # Use first 2000 transactions (or up to count) to train
+        train_pool = transactions[:min(2000, len(transactions))]
+        ml_model = MLTrainer.train_isolation_forest(train_pool)
+    
     # --- Single Threaded Evaluation ---
-    analyzer_single = FraudAnalyzer()
+    analyzer_single = FraudAnalyzer(ml_model=ml_model)
     start_time = time.time()
     WorkManager.process_single_threaded(transactions, analyzer_single)
     single_time = time.time() - start_time
     _print_results(analyzer_single, single_time, "Single-Threaded")
 
     # --- Multi Threaded Evaluation ---
-    analyzer_multi = FraudAnalyzer()
+    analyzer_multi = FraudAnalyzer(ml_model=ml_model)
     start_time = time.time()
     WorkManager.process_multi_threaded(transactions, analyzer_multi, thread_count=args.threads)
     multi_time = time.time() - start_time

@@ -1,12 +1,15 @@
 import threading
 import math
+import numpy as np
+from ml_trainer import extract_features
 
 class FraudAnalyzer:
     """
     Analyzes transactions for fraudulent behavior in a thread-safe manner.
     """
-    def __init__(self):
+    def __init__(self, ml_model=None):
         self.lock = threading.Lock()
+        self.ml_model = ml_model
         
         # User history: Dict[user_id, List[transaction]]
         self.user_history = {}
@@ -49,32 +52,18 @@ class FraudAnalyzer:
         Returns the analysis result.
         """
         import time
-        # Simulate an external I/O bound operation like a database query or network request.
-        # This is where multi-threading provides massive speed up in Python by releasing the GIL!
-        time.sleep(0.001) 
+        # Simulate a realistic I/O bound network request (e.g. 10ms database lookup or RPC call)
+        # Because Scikit-Learn `.predict()` operations are extremely CPU heavy and suffer from Python's GIL,
+        # real-world multi-threading depends on these network delays to cycle active threads.
+        time.sleep(0.01) 
         
+        user_id = tx["user_id"]
+        amount = tx["amount"]
+        location = tx["location"]
+        timestamp = tx["timestamp"]
+        
+        # 1. State modification and snapshotting inside minimal lock block
         with self.lock:
-            user_id = tx["user_id"]
-            amount = tx["amount"]
-            location = tx["location"]
-            timestamp = tx["timestamp"]
-            
-            risk_score = 0
-            reasons = []
-            
-            # Rule 1: High-value transaction
-            if amount > 10000.0:
-                risk_score += 50
-                reasons.append("High value transaction")
-                
-            # Rule 4: Statistical anomaly (using z-score)
-            std_dev = self._get_std_dev()
-            if self.count >= 10 and std_dev > 0:
-                z_score = abs(amount - self.mean) / std_dev
-                if z_score > 3.0:
-                    risk_score += 40
-                    reasons.append(f"Statistical anomaly (Z-score: {z_score:.2f})")
-            
             # Update global stats safely
             self._update_global_stats(amount)
             
@@ -87,31 +76,62 @@ class FraudAnalyzer:
             if len(history) > 10:
                 history.pop(0)  # Keep recent history
                 
-            # Rule 2 & 3: Rapid successive transactions & Location anomaly
-            # Check transactions within the last 60 seconds
-            recent_txs = [t for t in history if timestamp - t["timestamp"] < 60]
+            # Snapshot for unlocked processing
+            std_dev_copy = self._get_std_dev()
+            mean_copy = self.mean
+            count_copy = self.count
+            history_copy = list(history)
             
-            if len(recent_txs) >= 4:  # If user did 4+ transactions very recently
-                risk_score += 30
-                reasons.append("Rapid successive transactions")
+        # 2. Heavy calculations running entirely OUTSIDE the lock concurrently
+        risk_score = 0
+        reasons = []
+        
+        # Rule 1: High-value transaction
+        if amount > 10000.0:
+            risk_score += 50
+            reasons.append("High value transaction")
+            
+        # Rule 4: Statistical anomaly (using z-score)
+        if count_copy >= 10 and std_dev_copy > 0:
+            z_score = abs(amount - mean_copy) / std_dev_copy
+            if z_score > 3.0:
+                risk_score += 40
+                reasons.append(f"Statistical anomaly (Z-score: {z_score:.2f})")
                 
-            locations = set(t["location"] for t in recent_txs)
-            if len(locations) > 1:
-                risk_score += 60
-                reasons.append("Location anomaly (impossible travel)")
+        # Rule 2 & 3: Rapid successive transactions & Location anomaly
+        recent_txs = [t for t in history_copy if timestamp - t["timestamp"] < 60]
+        
+        if len(recent_txs) >= 4:
+            risk_score += 30
+            reasons.append("Rapid successive transactions")
+            
+        locations = set(t["location"] for t in recent_txs)
+        if len(locations) > 1:
+            risk_score += 60
+            reasons.append("Location anomaly (impossible travel)")
+            
+        # ML Integration Rule (This was bottlenecking multi-threading before!)
+        if self.ml_model is not None:
+            feats = extract_features(tx, history_copy)
+            prediction = self.ml_model.predict([feats])[0]
+            if prediction == -1:
+                risk_score += 50
+                reasons.append("Machine Learning Anomaly")
                 
-            # Aggregate Final Score
-            risk_score = min(100, risk_score)
-            fraud_flag = risk_score >= 50
-            reason_str = ", ".join(reasons) if reasons else "Normal"
-            
-            result = {
-                "transaction_id": tx["transaction_id"],
-                "risk_score": risk_score,
-                "fraud_flag": fraud_flag,
-                "reason": reason_str
-            }
-            
+        # Aggregate Final Score
+        risk_score = min(100, risk_score)
+        fraud_flag = risk_score >= 50
+        reason_str = ", ".join(reasons) if reasons else "Normal"
+        
+        result = {
+            "transaction_id": tx["transaction_id"],
+            "risk_score": risk_score,
+            "fraud_flag": fraud_flag,
+            "reason": reason_str
+        }
+        
+        # 3. Quickly update global metrics inside minimal lock
+        with self.lock:
             self.total_processed += 1
             if fraud_flag:
                 self.total_flagged += 1
